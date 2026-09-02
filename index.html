@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>録音専用ページ - 会議トランスクリプト作成</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --card-bg: #fff; --border: #e0e4ea; --text: #1f2430; --text-sub: #6b7280;
+    --accent: #3462eb; --accent-bg: #eaf0ff; --ok-bg: #e8f7ee; --ok-text: #1a7f3c;
+    --err-bg: #fdecec; --err-text: #b3261e;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "Hiragino Sans", "Meiryo", sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px 16px 64px; }
+  .container { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-sub); font-size: 12px; margin-bottom: 20px; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 14px; }
+  label { display: block; font-size: 12px; color: var(--text-sub); margin: 10px 0 4px; }
+  select, textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; font-family: inherit; }
+  textarea { min-height: 180px; resize: vertical; }
+  button { padding: 10px 16px; border-radius: 6px; border: none; font-size: 14px; cursor: pointer; font-weight: 600; margin-right: 8px; margin-top: 10px; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:disabled { background: #b9c4e0; cursor: not-allowed; }
+  .btn-secondary { background: var(--accent-bg); color: var(--accent); }
+  .btn-danger { background: #fde2e2; color: var(--err-text); }
+  .banner { border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
+  .banner.ok { background: var(--ok-bg); color: var(--ok-text); }
+  .banner.err { background: var(--err-bg); color: var(--err-text); }
+  .banner.info { background: var(--accent-bg); color: var(--accent); }
+  .hint { font-size: 11px; color: var(--text-sub); margin-top: 8px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>録音専用ページ</h1>
+  <div class="subtitle">このページはメイン画面（会議トランスクリプト作成）とは別ドメインで動作し、マイク／PC音声を扱います。</div>
+
+  <div class="card">
+    <label>マイク選択</label>
+    <select id="micSelect"><option value="">読み込み中...</option></select>
+    <div id="modeHint" class="hint"></div>
+
+    <div>
+      <button type="button" class="btn-primary" id="toggleBtn">文字起こし開始</button>
+      <button type="button" class="btn-secondary" id="sendBtn" disabled>メイン画面に送る</button>
+      <button type="button" class="btn-secondary" id="copyBtn" disabled>テキストをコピー</button>
+    </div>
+
+    <label>文字起こし結果</label>
+    <textarea id="transcript" readonly placeholder="ここに文字起こし結果が表示されます"></textarea>
+
+    <div id="statusBanner"></div>
+  </div>
+</div>
+
+<script>
+  var params = new URLSearchParams(location.search);
+  var mode = params.get('mode') === 'mic_system' ? 'mic_system' : 'mic';
+  var returnOrigin = params.get('returnOrigin') || '';
+
+  document.getElementById('modeHint').textContent = mode === 'mic_system'
+    ? 'PC音声＋マイクモード: 「文字起こし開始」を押すと、まずタブ/画面共有の選択画面が出ます（音声共有を必ずONにしてください）。続けてマイクの許可を求められます。'
+    : 'マイクのみモード: 「文字起こし開始」を押すとマイクの使用許可を求められます。';
+
+  var recognition = null;
+  var recognizing = false;
+  var finalTranscript = '';
+  var activeStreams = [];
+  var audioContext = null;
+
+  function setStatus(type, text) {
+    var el = document.getElementById('statusBanner');
+    el.className = 'banner ' + type;
+    el.textContent = text;
+  }
+
+  function getSpeechRecognitionCtor() {
+    return window.SpeechRecognition || window.webkitSpeechRecognition;
+  }
+
+  async function populateMicList() {
+    var select = document.getElementById('micSelect');
+    try {
+      var tmpStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      tmpStream.getTracks().forEach(function (t) { t.stop(); });
+    } catch (e) {
+      setStatus('err', 'マイクへのアクセスが許可されませんでした: ' + e.message);
+    }
+    try {
+      var devices = await navigator.mediaDevices.enumerateDevices();
+      var mics = devices.filter(function (d) { return d.kind === 'audioinput'; });
+      select.innerHTML = '';
+      mics.forEach(function (d, i) {
+        var opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || ('マイク ' + (i + 1));
+        select.appendChild(opt);
+      });
+      if (mics.length === 0) {
+        select.innerHTML = '<option value="">マイクが見つかりません</option>';
+      }
+    } catch (e) {
+      select.innerHTML = '<option value="">デバイス一覧の取得に失敗しました</option>';
+    }
+  }
+  populateMicList();
+
+  function stopAllStreams() {
+    activeStreams.forEach(function (s) { s.getTracks().forEach(function (t) { t.stop(); }); });
+    activeStreams = [];
+    if (audioContext) { audioContext.close(); audioContext = null; }
+  }
+
+  async function buildAudioTrack() {
+    var deviceId = document.getElementById('micSelect').value;
+    var micConstraint = deviceId ? { deviceId: { exact: deviceId } } : true;
+
+    if (mode === 'mic') {
+      var micStream = await navigator.mediaDevices.getUserMedia({ audio: micConstraint });
+      activeStreams.push(micStream);
+      return micStream.getAudioTracks()[0];
+    }
+
+    // mic_system: PC音声（タブ/画面共有）＋マイクをミックス
+    var displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    activeStreams.push(displayStream);
+    displayStream.getVideoTracks().forEach(function (t) { t.stop(); });
+
+    var micStream2 = await navigator.mediaDevices.getUserMedia({ audio: micConstraint });
+    activeStreams.push(micStream2);
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    var dest = audioContext.createMediaStreamDestination();
+
+    var displayAudioTracks = displayStream.getAudioTracks();
+    if (displayAudioTracks.length > 0) {
+      audioContext.createMediaStreamSource(new MediaStream(displayAudioTracks)).connect(dest);
+    } else {
+      setStatus('err', '共有元からシステム音声を取得できませんでした（共有時に「音声を共有」がONになっているか確認してください）。マイクのみで続行します。');
+    }
+    audioContext.createMediaStreamSource(micStream2).connect(dest);
+
+    return dest.stream.getAudioTracks()[0];
+  }
+
+  document.getElementById('toggleBtn').addEventListener('click', async function () {
+    var btn = this;
+    var SpeechRecognitionCtor = getSpeechRecognitionCtor();
+    if (!SpeechRecognitionCtor) {
+      setStatus('err', 'このブラウザは音声認識に対応していません。Chromeをご利用ください。');
+      return;
+    }
+
+    if (!recognizing) {
+      btn.disabled = true;
+      try {
+        var track = await buildAudioTrack();
+
+        recognition = new SpeechRecognitionCtor();
+        recognition.lang = 'ja-JP';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+
+        recognition.onresult = function (event) {
+          var interim = '';
+          for (var i = event.resultIndex; i < event.results.length; i++) {
+            var t = event.results[i][0].transcript;
+            if (event.results[i].isFinal) { finalTranscript += t + '\n'; } else { interim += t; }
+          }
+          document.getElementById('transcript').value = finalTranscript + interim;
+        };
+        recognition.onerror = function (event) {
+          setStatus('err', '音声認識エラー: ' + event.error);
+        };
+        recognition.onend = function () {
+          if (recognizing) {
+            try { recognition.start(track); } catch (e) { try { recognition.start(); } catch (e2) {} }
+          }
+        };
+
+        try {
+          recognition.start(track); // MediaStreamTrackを直接指定（対応ブラウザのみ）
+        } catch (e) {
+          recognition.start(); // 未対応時はデフォルトマイクにフォールバック
+          setStatus('info', 'お使いのブラウザは選択したデバイス/PC音声の直接指定に対応していないため、既定のマイクで認識します。');
+        }
+
+        recognizing = true;
+        btn.textContent = '文字起こし終了';
+        setStatus('info', '認識中...');
+      } catch (e) {
+        setStatus('err', 'マイク/画面共有の取得に失敗しました: ' + e.message);
+        stopAllStreams();
+      }
+      btn.disabled = false;
+    } else {
+      recognizing = false;
+      if (recognition) recognition.stop();
+      stopAllStreams();
+      btn.textContent = '文字起こし開始';
+      document.getElementById('sendBtn').disabled = !finalTranscript.trim();
+      document.getElementById('copyBtn').disabled = !finalTranscript.trim();
+      setStatus('ok', '文字起こしを終了しました。');
+    }
+  });
+
+  document.getElementById('sendBtn').addEventListener('click', function () {
+    if (!window.opener || !returnOrigin) {
+      setStatus('err', 'メイン画面が見つかりません。このページをメイン画面から開いたか確認してください。「テキストをコピー」で手動貼り付けも可能です。');
+      return;
+    }
+    window.opener.postMessage({ type: 'meeting-memo-transcript', text: finalTranscript }, returnOrigin);
+    setStatus('ok', 'メイン画面に送信しました。このタブは閉じて構いません。');
+  });
+
+  document.getElementById('copyBtn').addEventListener('click', async function () {
+    try {
+      await navigator.clipboard.writeText(finalTranscript);
+      setStatus('ok', 'コピーしました。');
+    } catch (e) {
+      var ta = document.getElementById('transcript');
+      ta.removeAttribute('readonly');
+      ta.select();
+      document.execCommand('copy');
+      ta.setAttribute('readonly', 'readonly');
+      setStatus('ok', 'コピーしました。');
+    }
+  });
+</script>
+</body>
+</html>
