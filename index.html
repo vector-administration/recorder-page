@@ -99,6 +99,10 @@
       });
       if (mics.length === 0) {
         select.innerHTML = '<option value="">マイクが見つかりません</option>';
+      } else {
+        // Chromeは既定デバイスを deviceId: 'default' として公開するため、あればそれを選択状態にする
+        var defaultMic = mics.find(function (d) { return d.deviceId === 'default'; });
+        select.value = defaultMic ? defaultMic.deviceId : mics[0].deviceId;
       }
     } catch (e) {
       select.innerHTML = '<option value="">デバイス一覧の取得に失敗しました</option>';
@@ -171,11 +175,15 @@
           document.getElementById('transcript').value = finalTranscript + interim;
         };
         recognition.onerror = function (event) {
+          // Chromeの音声認識は一定時間ごとに内部接続が切れて'network'エラーを出すことがあるが、
+          // 直後のonendで自動的に再開されるため、認識中はエラー表示にしない
+          if (event.error === 'network' && recognizing) return;
           setStatus('err', '音声認識エラー: ' + event.error);
         };
         recognition.onend = function () {
           if (recognizing) {
             try { recognition.start(track); } catch (e) { try { recognition.start(); } catch (e2) {} }
+            setStatus('info', '認識中...');
           }
         };
 
